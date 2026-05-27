@@ -2739,6 +2739,98 @@ const _waitFb=setInterval(()=>{
     loadFromCloud();
   }
 },80);
+  <!-- LOGIN RL3D -->
+<div id="auth-screen" style="
+position:fixed;
+inset:0;
+background:#070b14;
+display:flex;
+align-items:center;
+justify-content:center;
+z-index:99999;
+font-family:sans-serif;
+">
+  <div style="
+  width:360px;
+  background:#111827;
+  border-radius:14px;
+  padding:30px;
+  color:white;
+  box-shadow:0 0 40px rgba(0,0,0,.5);
+  ">
+    <h2 style="margin-bottom:20px">RL3D Login</h2>
+
+    <input id="login-email" type="email" placeholder="E-mail" style="
+    width:100%;
+    padding:12px;
+    margin-bottom:12px;
+    border:none;
+    border-radius:8px;
+    background:#1f2937;
+    color:white;
+    ">
+
+    <input id="login-password" type="password" placeholder="Senha" style="
+    width:100%;
+    padding:12px;
+    margin-bottom:12px;
+    border:none;
+    border-radius:8px;
+    background:#1f2937;
+    color:white;
+    ">
+
+    <button onclick="loginRL3D()" style="
+    width:100%;
+    padding:12px;
+    border:none;
+    border-radius:8px;
+    background:#2563eb;
+    color:white;
+    font-weight:bold;
+    cursor:pointer;
+    ">
+      Entrar
+    </button>
+  </div>
+</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+
+import {
+  getAuth,
+  signInWithEmailAndPassword,
+  onAuthStateChanged
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+const firebaseConfig = {
+  apiKey: "SUA_API_KEY",
+  authDomain: "SEU_AUTH_DOMAIN",
+  projectId: "SEU_PROJECT_ID",
+  appId: "SEU_APP_ID"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+
+window.loginRL3D = async function () {
+  const email = document.getElementById("login-email").value;
+  const password = document.getElementById("login-password").value;
+
+  try {
+    await signInWithEmailAndPassword(auth, email, password);
+  } catch (e) {
+    alert("Erro: " + e.message);
+  }
+};
+
+onAuthStateChanged(auth, (user) => {
+  if (user) {
+    document.getElementById("auth-screen").style.display = "none";
+  }
+});
+</script>
 </script>
 </body>
 </html>
