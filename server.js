@@ -14,11 +14,6 @@ const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '100kb' }));
 
-// Painel principal
-app.get('/', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
-});
-
 const required = [
   'ML_CLIENT_ID',
   'ML_CLIENT_SECRET',
@@ -26,10 +21,12 @@ const required = [
 ];
 
 let mlTokens = null;
-
-// Armazenamento temporário das tentativas OAuth
 const pendingOAuth = new Map();
 const OAUTH_TTL_MS = 10 * 60 * 1000;
+
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
 
 function missingConfig() {
   return required.filter(key => !process.env[key]);
@@ -44,7 +41,6 @@ function saveTokens(data) {
   };
 }
 
-// Renovação automática do token
 async function refreshAccessToken() {
   if (!mlTokens) {
     throw new Error('Conecte sua conta do Mercado Livre primeiro.');
@@ -87,7 +83,6 @@ async function refreshAccessToken() {
   return mlTokens.accessToken;
 }
 
-// Consultas autenticadas
 async function mlGet(url) {
   const accessToken = await refreshAccessToken();
 
@@ -97,28 +92,30 @@ async function mlGet(url) {
     }
   });
 
-  const data = await response.json();
+  const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
     throw new Error(
-      data.message || `Erro Mercado Livre: ${response.status}`
+      data.message ||
+      data.error ||
+      `Erro Mercado Livre: ${response.status}`
     );
   }
 
   return data;
 }
 
-// INÍCIO DO OAUTH COM PKCE
+// OAUTH - CONEXÃO
+
 app.get('/auth/ml', (req, res) => {
   const missing = missingConfig();
 
   if (missing.length) {
     return res.status(500).send(
-      `Configure no Render as variáveis: ${missing.join(', ')}`
+      `Configure no Render: ${missing.join(', ')}`
     );
   }
 
-  // Remove tentativas expiradas
   const now = Date.now();
 
   for (const [key, value] of pendingOAuth.entries()) {
@@ -127,21 +124,17 @@ app.get('/auth/ml', (req, res) => {
     }
   }
 
-  // Gera state
   const state = crypto.randomBytes(32).toString('hex');
 
-  // Gera PKCE verifier
   const codeVerifier = crypto
     .randomBytes(32)
     .toString('base64url');
 
-  // Gera PKCE challenge SHA256
   const codeChallenge = crypto
     .createHash('sha256')
     .update(codeVerifier)
     .digest('base64url');
 
-  // Guarda verifier no servidor
   pendingOAuth.set(state, {
     codeVerifier,
     expiresAt: now + OAUTH_TTL_MS
@@ -152,30 +145,17 @@ app.get('/auth/ml', (req, res) => {
   );
 
   authorizationUrl.searchParams.set('response_type', 'code');
-  authorizationUrl.searchParams.set(
-    'client_id',
-    process.env.ML_CLIENT_ID
-  );
-  authorizationUrl.searchParams.set(
-    'redirect_uri',
-    process.env.ML_REDIRECT_URI
-  );
+  authorizationUrl.searchParams.set('client_id', process.env.ML_CLIENT_ID);
+  authorizationUrl.searchParams.set('redirect_uri', process.env.ML_REDIRECT_URI);
   authorizationUrl.searchParams.set('state', state);
-
-  authorizationUrl.searchParams.set(
-    'code_challenge',
-    codeChallenge
-  );
-
-  authorizationUrl.searchParams.set(
-    'code_challenge_method',
-    'S256'
-  );
+  authorizationUrl.searchParams.set('code_challenge', codeChallenge);
+  authorizationUrl.searchParams.set('code_challenge_method', 'S256');
 
   res.redirect(authorizationUrl.toString());
 });
 
 // CALLBACK OAUTH
+
 app.get('/auth/callback', async (req, res) => {
   try {
     if (req.query.error) {
@@ -191,47 +171,24 @@ app.get('/auth/callback', async (req, res) => {
     }
 
     const pending = pendingOAuth.get(receivedState);
-
     pendingOAuth.delete(receivedState);
 
     if (!pending || pending.expiresAt <= Date.now()) {
-      throw new Error(
-        'Sessão expirada. Inicie a conexão novamente.'
-      );
+      throw new Error('Sessão expirada. Conecte novamente.');
     }
 
     if (!req.query.code) {
       throw new Error('Código de autorização não recebido.');
     }
 
-    if (!pending.codeVerifier) {
-      throw new Error('PKCE code_verifier não encontrado.');
-    }
-
-    // PARÂMETROS DA TROCA DO TOKEN
-    const tokenParams = new URLSearchParams();
-
-    tokenParams.set('grant_type', 'authorization_code');
-    tokenParams.set('client_id', process.env.ML_CLIENT_ID);
-    tokenParams.set(
-      'client_secret',
-      process.env.ML_CLIENT_SECRET
-    );
-    tokenParams.set('code', String(req.query.code));
-    tokenParams.set(
-      'redirect_uri',
-      process.env.ML_REDIRECT_URI
-    );
-
-    // PARÂMETRO PKCE OBRIGATÓRIO
-    tokenParams.set(
-      'code_verifier',
-      pending.codeVerifier
-    );
-
-    console.log(
-      'Iniciando troca OAuth com code_verifier.'
-    );
+    const tokenParams = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: process.env.ML_CLIENT_ID,
+      client_secret: process.env.ML_CLIENT_SECRET,
+      code: String(req.query.code),
+      redirect_uri: process.env.ML_REDIRECT_URI,
+      code_verifier: pending.codeVerifier
+    });
 
     const tokenResponse = await fetch(
       'https://api.mercadolibre.com/oauth/token',
@@ -247,11 +204,6 @@ app.get('/auth/callback', async (req, res) => {
     const tokenData = await tokenResponse.json();
 
     if (!tokenResponse.ok) {
-      console.error(
-        'Erro OAuth:',
-        tokenData.error || tokenData.message
-      );
-
       throw new Error(
         tokenData.message ||
         tokenData.error_description ||
@@ -262,21 +214,22 @@ app.get('/auth/callback', async (req, res) => {
 
     saveTokens(tokenData);
 
-    console.log('Mercado Livre conectado com sucesso.');
+    console.log('Mercado Livre conectado.');
 
-    return res.redirect('/?ml=connected');
+    res.redirect('/?ml=connected');
 
   } catch (error) {
-    console.error('Falha OAuth:', error.message);
+    console.error('Erro OAuth:', error.message);
 
-    return res.redirect(
+    res.redirect(
       '/?ml=error&reason=' +
       encodeURIComponent(error.message)
     );
   }
 });
 
-// STATUS DA CONEXÃO
+// STATUS
+
 app.get('/api/ml/status', (_req, res) => {
   res.json({
     connected: !!mlTokens,
@@ -286,13 +239,11 @@ app.get('/api/ml/status', (_req, res) => {
   });
 });
 
-// DESCONEXÃO
 app.post('/api/ml/disconnect', (_req, res) => {
   mlTokens = null;
   res.json({ ok: true });
 });
 
-// DADOS DO VENDEDOR
 app.get('/api/ml/me', async (_req, res) => {
   try {
     const user = await mlGet(
@@ -302,14 +253,239 @@ app.get('/api/ml/me', async (_req, res) => {
     res.json(user);
 
   } catch (error) {
-    res.status(401).json({
-      error: error.message
-    });
+    res.status(401).json({ error: error.message });
   }
 });
 
-// SINCRONIZAÇÃO DE VENDAS
-app.post('/api/ml/sync', async (_req, res) => {
+// HISTÓRICO COMPLETO DO ANO
+
+async function fetchYearOrders(sellerId, year) {
+  const start = `${year}-01-01T00:00:00.000-03:00`;
+
+  const now = new Date();
+
+  const end = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}T23:59:59.999-03:00`;
+
+  const limit = 50;
+  let offset = 0;
+  let total = null;
+
+  const all = [];
+  const seen = new Set();
+
+  while (total === null || offset < total) {
+    const url = new URL(
+      'https://api.mercadolibre.com/orders/search'
+    );
+
+    url.searchParams.set('seller', sellerId);
+    url.searchParams.set('sort', 'date_desc');
+    url.searchParams.set('limit', String(limit));
+    url.searchParams.set('offset', String(offset));
+    url.searchParams.set('order.date_created.from', start);
+    url.searchParams.set('order.date_created.to', end);
+
+    const page = await mlGet(url.toString());
+
+    const results = Array.isArray(page.results)
+      ? page.results
+      : [];
+
+    total = Number(
+      page.paging?.total ?? (offset + results.length)
+    );
+
+    for (const order of results) {
+      const key = String(order.id);
+
+      if (!seen.has(key)) {
+        seen.add(key);
+        all.push(order);
+      }
+    }
+
+    if (!results.length) break;
+
+    offset += results.length;
+
+    if (offset > 100000) {
+      throw new Error('Limite de paginação excedido.');
+    }
+  }
+
+  return {
+    orders: all,
+    total: total ?? all.length,
+    start,
+    end
+  };
+}
+
+// FORMATAÇÃO DOS PEDIDOS
+
+function compactOrder(order) {
+  return {
+    id: order.id,
+    date_created: order.date_created,
+    date_closed: order.date_closed,
+    status: order.status,
+
+    buyer: {
+      id: order.buyer?.id || null
+    },
+
+    total_amount: order.total_amount,
+    paid_amount: order.paid_amount,
+    currency_id: order.currency_id,
+
+    order_items: (order.order_items || []).map(item => ({
+      item: {
+        id: item.item?.id || null,
+        title: item.item?.title || null
+      },
+      quantity: item.quantity,
+      unit_price: item.unit_price,
+      listing_type_id: item.listing_type_id
+    })),
+
+    payments: (order.payments || []).map(payment => ({
+      id: payment.id,
+      status: payment.status,
+      total_paid_amount: payment.total_paid_amount,
+      transaction_amount: payment.transaction_amount,
+      date_approved: payment.date_approved
+    }))
+  };
+}
+
+// CATÁLOGO DOS PRODUTOS VENDIDOS
+
+async function fetchSoldProducts(orders) {
+  const ids = [
+    ...new Set(
+      orders.flatMap(order =>
+        (order.order_items || [])
+          .map(item => item.item?.id)
+          .filter(Boolean)
+      )
+    )
+  ];
+
+  const products = [];
+  const concurrency = 5;
+
+  for (let i = 0; i < ids.length; i += concurrency) {
+    const batch = ids.slice(i, i + concurrency);
+
+    const results = await Promise.all(
+      batch.map(async id => {
+        try {
+          const item = await mlGet(
+            `https://api.mercadolibre.com/items/${encodeURIComponent(id)}`
+          );
+
+          return {
+            id: item.id,
+            title: item.title || id,
+            price: item.price ?? null,
+            currency_id: item.currency_id || 'BRL',
+            status: item.status || 'unknown',
+            thumbnail: item.thumbnail ||
+              item.pictures?.[0]?.secure_url ||
+              null,
+            permalink: item.permalink || null,
+            available_quantity: item.available_quantity ?? null
+          };
+
+        } catch (error) {
+          console.warn(
+            `Erro no anúncio ${id}: ${error.message}`
+          );
+
+          return {
+            id,
+            title: id,
+            price: null,
+            status: 'indisponível',
+            thumbnail: null,
+            permalink: null
+          };
+        }
+      })
+    );
+
+    products.push(...results);
+  }
+
+  return products;
+}
+
+// VISUALIZAÇÕES MENSAIS
+
+async function fetchYearVisits(userId, year) {
+  const now = new Date();
+
+  const currentYear = now.getFullYear();
+  const currentMonth = now.getMonth() + 1;
+
+  const metrics = {};
+
+  for (let month = 1; month <= 12; month++) {
+
+    if (
+      year > currentYear ||
+      (year === currentYear && month > currentMonth)
+    ) {
+      continue;
+    }
+
+    const from = `${year}-${String(month).padStart(2,'0')}-01`;
+
+    const lastDay = new Date(year, month, 0).getDate();
+
+    const toDate =
+      year === currentYear && month === currentMonth
+        ? now
+        : new Date(year, month - 1, lastDay);
+
+    const to = `${toDate.getFullYear()}-${String(toDate.getMonth()+1).padStart(2,'0')}-${String(toDate.getDate()).padStart(2,'0')}`;
+
+    try {
+      const url = new URL(
+        `https://api.mercadolibre.com/users/${encodeURIComponent(userId)}/items_visits`
+      );
+
+      url.searchParams.set('date_from', from);
+      url.searchParams.set('date_to', to);
+
+      const data = await mlGet(url.toString());
+
+      metrics[`${year}-${String(month).padStart(2,'0')}`] = {
+        visits: Number(data.total_visits || 0),
+        date_from: from,
+        date_to: to
+      };
+
+    } catch (error) {
+      console.warn(
+        `Erro nas visitas ${from}: ${error.message}`
+      );
+
+      metrics[`${year}-${String(month).padStart(2,'0')}`] = {
+        visits: null,
+        date_from: from,
+        date_to: to,
+        unavailable: true
+      };
+    }
+  }
+
+  return metrics;
+}
+
+// SINCRONIZAÇÃO PRINCIPAL
+
+app.post('/api/ml/sync', async (req, res) => {
   try {
     if (!mlTokens) {
       return res.status(401).json({
@@ -317,66 +493,84 @@ app.post('/api/ml/sync', async (_req, res) => {
       });
     }
 
+    const requestedYear = Number(
+      req.body?.year || new Date().getFullYear()
+    );
+
+    if (
+      !Number.isInteger(requestedYear) ||
+      requestedYear < 2020 ||
+      requestedYear > new Date().getFullYear()
+    ) {
+      return res.status(400).json({
+        error: 'Ano inválido.'
+      });
+    }
+
     const user = await mlGet(
       'https://api.mercadolibre.com/users/me'
     );
 
-    const ordersUrl = new URL(
-      'https://api.mercadolibre.com/orders/search'
+    console.log(`Sincronizando pedidos de ${requestedYear}...`);
+
+    const history = await fetchYearOrders(
+      user.id,
+      requestedYear
     );
 
-    ordersUrl.searchParams.set('seller', user.id);
-    ordersUrl.searchParams.set('sort', 'date_desc');
-    ordersUrl.searchParams.set('limit', '50');
+    const ordersData = history.orders.map(compactOrder);
 
-    const result = await mlGet(ordersUrl.toString());
+    console.log(`${ordersData.length} pedidos encontrados.`);
 
-    const orders = (result.results || []).map(order => ({
-      id: order.id,
-      date_created: order.date_created,
-      status: order.status,
-      buyer: {
-        id: order.buyer?.id || null
-      },
-      total_amount: order.total_amount,
-      currency_id: order.currency_id,
+    const [products, monthlyMetrics] = await Promise.all([
+      fetchSoldProducts(history.orders),
+      fetchYearVisits(user.id, requestedYear)
+    ]);
 
-      order_items: (order.order_items || []).map(item => ({
-        item_id: item.item?.id,
-        title: item.item?.title,
-        quantity: item.quantity,
-        unit_price: item.unit_price,
-        listing_type_id: item.listing_type_id
-      })),
-
-      payments: (order.payments || []).map(payment => ({
-        id: payment.id,
-        status: payment.status,
-        total_paid_amount: payment.total_paid_amount,
-        transaction_amount: payment.transaction_amount,
-        date_approved: payment.date_approved
-      }))
-    }));
+    const paidOrders = ordersData.filter(order =>
+      order.status === 'paid' ||
+      (order.payments || []).some(
+        payment => payment.status === 'approved'
+      )
+    );
 
     res.json({
       ok: true,
+      year: requestedYear,
+
       user: {
         id: user.id,
         nickname: user.nickname
       },
-      total: result.paging?.total ?? orders.length,
-      ordersData: orders,
-      note: 'Consulta dos últimos 50 pedidos.'
+
+      total: history.total,
+      loaded: ordersData.length,
+
+      ordersData,
+      products,
+
+      dashboard: {
+        year: requestedYear,
+        monthlyMetrics,
+        paidOrders: paidOrders.length,
+        dateFrom: history.start,
+        dateTo: history.end
+      },
+
+      note: `Histórico de ${requestedYear} consultado.`
     });
 
   } catch (error) {
+    console.error('Erro na sincronização:', error);
+
     res.status(500).json({
-      error: error.message
+      error: error.message || 'Falha na sincronização.'
     });
   }
 });
 
-// TESTE DO SERVIDOR
+// TESTE
+
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
