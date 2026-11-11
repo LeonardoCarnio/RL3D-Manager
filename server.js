@@ -28,6 +28,7 @@ const saoPauloDateParts = (date = new Date()) => {
   }).formatToParts(date);
   return Object.fromEntries(parts.filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
 };
+
 const saoPauloDateKey = (date = new Date()) => {
   const parts = saoPauloDateParts(date);
   return `${parts.year}-${parts.month}-${parts.day}`;
@@ -82,6 +83,7 @@ async function mlGet(url) {
   return data;
 }
 
+// INÍCIO DO OAUTH COM PKCE
 app.get('/auth/ml', (req, res) => {
   const missing = missingConfig();
   if (missing.length) return res.status(500).send(`Configure no Render as variáveis: ${missing.join(', ')}`);
@@ -107,6 +109,7 @@ app.get('/auth/ml', (req, res) => {
   res.redirect(authorizationUrl.toString());
 });
 
+// CALLBACK OAUTH
 app.get('/auth/callback', async (req, res) => {
   try {
     if (req.query.error) throw new Error(String(req.query.error_description || req.query.error));
@@ -149,6 +152,7 @@ app.get('/auth/callback', async (req, res) => {
   }
 });
 
+// STATUS DA CONEXÃO
 app.get('/api/ml/status', (_req, res) => {
   res.json({
     connected: !!mlTokens,
@@ -158,11 +162,13 @@ app.get('/api/ml/status', (_req, res) => {
   });
 });
 
+// DESCONEXÃO
 app.post('/api/ml/disconnect', (_req, res) => {
   mlTokens = null;
   res.json({ ok: true });
 });
 
+// DADOS DO VENDEDOR
 app.get('/api/ml/me', async (_req, res) => {
   try {
     const user = await mlGet('https://api.mercadolibre.com/users/me');
@@ -172,7 +178,7 @@ app.get('/api/ml/me', async (_req, res) => {
   }
 });
 
-// Pedidos de 1º de janeiro do ano solicitado até hoje, com paginação.
+// HISTÓRICO DE PEDIDOS DO ANO, COM PAGINAÇÃO
 async function fetchYearOrders(sellerId, year) {
   const start = `${year}-01-01T00:00:00.000-03:00`;
   const todaySP = saoPauloDateKey();
@@ -196,6 +202,7 @@ async function fetchYearOrders(sellerId, year) {
     const page = await mlGet(url.toString());
     const results = Array.isArray(page.results) ? page.results : [];
     total = Number(page.paging?.total ?? (offset + results.length));
+
     for (const order of results) {
       const key = String(order.id);
       if (!seen.has(key)) {
@@ -203,6 +210,7 @@ async function fetchYearOrders(sellerId, year) {
         all.push(order);
       }
     }
+
     if (!results.length) break;
     offset += results.length;
     if (offset > 100000) throw new Error('A consulta excedeu o limite de segurança de paginação.');
@@ -240,15 +248,39 @@ function compactOrder(order) {
   };
 }
 
-async function fetchSoldProducts(orders) {
-  const ids = [...new Set(orders.flatMap(order =>
+// PRODUTOS VENDIDOS E ANÚNCIOS ATIVOS
+async function fetchSoldProducts(orders, sellerId) {
+  const soldIds = orders.flatMap(order =>
     (order.order_items || []).map(i => i.item?.id).filter(Boolean)
-  ))];
+  );
 
+  const activeIds = [];
+  let offset = 0;
+  let total = null;
+
+  while (total === null || offset < total) {
+    const url = new URL(`https://api.mercadolibre.com/users/${encodeURIComponent(sellerId)}/items/search`);
+    url.searchParams.set('status', 'active');
+    url.searchParams.set('limit', '100');
+    url.searchParams.set('offset', String(offset));
+
+    const page = await mlGet(url.toString());
+    const results = Array.isArray(page.results) ? page.results : [];
+    total = Number(page.paging?.total ?? (offset + results.length));
+    activeIds.push(...results);
+
+    if (!results.length) break;
+    offset += results.length;
+    if (offset >= 1000 || offset > total) break;
+  }
+
+  const ids = [...new Set([...soldIds, ...activeIds].map(String))];
   const products = [];
   const concurrency = 5;
+
   for (let i = 0; i < ids.length; i += concurrency) {
     const batch = ids.slice(i, i + concurrency);
+
     const results = await Promise.all(batch.map(async id => {
       try {
         const item = await mlGet(`https://api.mercadolibre.com/items/${encodeURIComponent(id)}`);
@@ -265,15 +297,24 @@ async function fetchSoldProducts(orders) {
         };
       } catch (error) {
         console.warn(`Não foi possível consultar o anúncio ${id}: ${error.message}`);
-        return { id, title: id, price: null, status: 'indisponível', thumbnail: null, permalink: null };
+        return {
+          id,
+          title: id,
+          price: null,
+          status: 'indisponível',
+          thumbnail: null,
+          permalink: null
+        };
       }
     }));
+
     products.push(...results);
   }
+
   return products;
 }
 
-// Visitas são consultadas mês a mês; o endpoint oficial limita a janela a 150 dias.
+// VISUALIZAÇÕES MENSAIS
 async function fetchYearVisits(userId, year) {
   const now = new Date();
   const todaySP = saoPauloDateParts(now);
@@ -283,24 +324,30 @@ async function fetchYearVisits(userId, year) {
 
   for (let month = 1; month <= 12; month++) {
     if (year > currentYear || (year === currentYear && month > currentMonth)) continue;
-    const from = `${year}-${String(month).padStart(2,'0')}-01`;
+
+    const from = `${year}-${String(month).padStart(2, '0')}-01`;
     const lastDay = new Date(year, month, 0).getDate();
+
     const to = year === currentYear && month === currentMonth
       ? `${todaySP.year}-${todaySP.month}-${todaySP.day}`
-      : `${year}-${String(month).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+      : `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+
     try {
       const url = new URL(`https://api.mercadolibre.com/users/${encodeURIComponent(userId)}/items_visits`);
       url.searchParams.set('date_from', from);
       url.searchParams.set('date_to', to);
+
       const data = await mlGet(url.toString());
-      metrics[`${year}-${String(month).padStart(2,'0')}`] = {
+
+      metrics[`${year}-${String(month).padStart(2, '0')}`] = {
         visits: Number(data.total_visits || 0),
         date_from: from,
         date_to: to
       };
     } catch (error) {
       console.warn(`Não foi possível consultar visitas de ${from} a ${to}: ${error.message}`);
-      metrics[`${year}-${String(month).padStart(2,'0')}`] = {
+
+      metrics[`${year}-${String(month).padStart(2, '0')}`] = {
         visits: null,
         date_from: from,
         date_to: to,
@@ -308,29 +355,36 @@ async function fetchYearVisits(userId, year) {
       };
     }
   }
+
   return metrics;
 }
 
+// SINCRONIZAÇÃO COMPLETA
 app.post('/api/ml/sync', async (req, res) => {
   try {
-    if (!mlTokens) return res.status(401).json({ error: 'Conta não conectada.' });
+    if (!mlTokens) {
+      return res.status(401).json({ error: 'Conta não conectada.' });
+    }
 
     const currentYearSP = Number(saoPauloDateParts().year);
     const requestedYear = Number(req.body?.year || currentYearSP);
+
     if (!Number.isInteger(requestedYear) || requestedYear < 2020 || requestedYear > currentYearSP) {
       return res.status(400).json({ error: 'Ano inválido para sincronização.' });
     }
 
     const user = await mlGet('https://api.mercadolibre.com/users/me');
     const history = await fetchYearOrders(user.id, requestedYear);
+
     const ordersData = history.orders.map(compactOrder);
+
     const [products, monthlyMetrics] = await Promise.all([
-      fetchSoldProducts(history.orders),
+      fetchSoldProducts(history.orders, user.id),
       fetchYearVisits(user.id, requestedYear)
     ]);
 
     const paidOrders = ordersData.filter(o =>
-      !['cancelled','refunded','invalid'].includes(String(o.status || '').toLowerCase()) &&
+      !['cancelled', 'refunded', 'invalid'].includes(String(o.status || '').toLowerCase()) &&
       (o.status === 'paid' || (o.payments || []).some(p => p.status === 'approved'))
     );
 
@@ -357,9 +411,117 @@ app.post('/api/ml/sync', async (req, res) => {
   }
 });
 
+// POSIÇÃO ORGÂNICA DOS ANÚNCIOS
+app.post('/api/ml/positions', async (req, res) => {
+  try {
+    if (!mlTokens) {
+      return res.status(401).json({ error: 'Conecte sua conta do Mercado Livre primeiro.' });
+    }
+
+    const checks = Array.isArray(req.body?.checks) ? req.body.checks : [];
+
+    if (!checks.length) {
+      return res.status(400).json({ error: 'Informe ao menos um anúncio e uma palavra-chave.' });
+    }
+
+    if (checks.length > 20) {
+      return res.status(400).json({ error: 'Consulte no máximo 20 anúncios por vez.' });
+    }
+
+    const results = [];
+
+    for (const check of checks) {
+      const itemId = String(check?.itemId || '').trim();
+      const keyword = String(check?.keyword || '').trim().slice(0, 100);
+
+      if (!itemId || !keyword) {
+        results.push({
+          itemId,
+          keyword,
+          found: false,
+          error: 'Anúncio ou palavra-chave ausente.'
+        });
+        continue;
+      }
+
+      let found = null;
+      let scanned = 0;
+      let total = null;
+      const pageSize = 50;
+      const maxPages = 5;
+
+      for (let pageIndex = 0; pageIndex < maxPages; pageIndex++) {
+        const url = new URL('https://api.mercadolibre.com/sites/MLB/search');
+        url.searchParams.set('q', keyword);
+        url.searchParams.set('limit', String(pageSize));
+        url.searchParams.set('offset', String(pageIndex * pageSize));
+
+        const data = await mlGet(url.toString());
+        const items = Array.isArray(data.results) ? data.results : [];
+
+        total = Number(data.paging?.total ?? total ?? items.length);
+
+        const index = items.findIndex(item => String(item.id) === itemId);
+        scanned += items.length;
+
+        if (index >= 0) {
+          const position = pageIndex * pageSize + index + 1;
+
+          found = {
+            found: true,
+            position,
+            page: Math.ceil(position / pageSize),
+            positionOnPage: ((position - 1) % pageSize) + 1,
+            title: items[index].title || null,
+            permalink: items[index].permalink || null
+          };
+
+          break;
+        }
+
+        if (!items.length || (total !== null && (pageIndex + 1) * pageSize >= total)) break;
+      }
+
+      results.push({
+        itemId,
+        keyword,
+        ...(found || {
+          found: false,
+          position: null,
+          page: null,
+          positionOnPage: null
+        }),
+        scanned,
+        total,
+        checkedAt: new Date().toISOString(),
+        source: 'Busca pública da API do Mercado Livre',
+        placementType: 'orgânico estimado'
+      });
+    }
+
+    res.json({
+      ok: true,
+      results,
+      note: 'A posição reflete a ordem retornada pela busca pública da API. Posições patrocinadas e resultados personalizados podem não estar representados.'
+    });
+
+  } catch (error) {
+    console.error('Erro ao consultar posições:', error);
+    res.status(500).json({ error: error.message || 'Falha ao consultar posições.' });
+  }
+});
+
+// TESTE DO SERVIDOR
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'RL3D Mercado Livre OAuth', storage: 'memory' });
+  res.json({
+    ok: true,
+    service: 'RL3D Mercado Livre OAuth',
+    storage: 'memory'
+  });
 });
 
 const port = Number(process.env.PORT || 3000);
-app.listen(port, () => console.log(`RL3D rodando na porta ${port}`));
+
+app.listen(port, () => {
+  console.log(`RL3D rodando na porta ${port}`);
+});
