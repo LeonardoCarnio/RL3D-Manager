@@ -24,9 +24,14 @@ const OAUTH_TTL_MS = 10 * 60 * 1000;
 const saoPauloDateParts = (date = new Date()) => {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/Sao_Paulo',
-    year: 'numeric', month: '2-digit', day: '2-digit'
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
   }).formatToParts(date);
-  return Object.fromEntries(parts.filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
+
+  return Object.fromEntries(
+    parts.filter(part => part.type !== 'literal').map(part => [part.type, part.value])
+  );
 };
 
 const saoPauloDateKey = (date = new Date()) => {
@@ -48,8 +53,13 @@ function saveTokens(data) {
 }
 
 async function refreshAccessToken() {
-  if (!mlTokens) throw new Error('Conecte sua conta do Mercado Livre primeiro.');
-  if (mlTokens.expiresAt > Date.now() + 60000) return mlTokens.accessToken;
+  if (!mlTokens) {
+    throw new Error('Conecte sua conta do Mercado Livre primeiro.');
+  }
+
+  if (mlTokens.expiresAt > Date.now() + 60000) {
+    return mlTokens.accessToken;
+  }
 
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
@@ -63,66 +73,106 @@ async function refreshAccessToken() {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString()
   });
+
   const data = await response.json();
 
   if (!response.ok) {
     mlTokens = null;
     throw new Error(data.message || data.error_description || 'Falha ao renovar token.');
   }
+
   saveTokens(data);
   return mlTokens.accessToken;
 }
 
 async function mlGet(url) {
   const accessToken = await refreshAccessToken();
-  const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+
   const data = await response.json().catch(() => ({}));
+
   if (!response.ok) {
-    throw new Error(data.message || data.error || `Erro Mercado Livre: ${response.status}`);
+    const error = new Error(
+      data.message || data.error || `Erro Mercado Livre: ${response.status}`
+    );
+    error.statusCode = response.status;
+    throw error;
   }
+
   return data;
 }
 
-// INÍCIO DO OAUTH COM PKCE
+// ==========================================
+// AUTENTICAÇÃO MERCADO LIVRE
+// ==========================================
+
 app.get('/auth/ml', (req, res) => {
   const missing = missingConfig();
-  if (missing.length) return res.status(500).send(`Configure no Render as variáveis: ${missing.join(', ')}`);
+
+  if (missing.length) {
+    return res.status(500).send(
+      `Configure no Render as variáveis: ${missing.join(', ')}`
+    );
+  }
 
   const now = Date.now();
+
   for (const [key, value] of pendingOAuth.entries()) {
     if (value.expiresAt <= now) pendingOAuth.delete(key);
   }
 
   const state = crypto.randomBytes(32).toString('hex');
   const codeVerifier = crypto.randomBytes(32).toString('base64url');
-  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
 
-  pendingOAuth.set(state, { codeVerifier, expiresAt: now + OAUTH_TTL_MS });
+  const codeChallenge = crypto
+    .createHash('sha256')
+    .update(codeVerifier)
+    .digest('base64url');
 
-  const authorizationUrl = new URL('https://auth.mercadolivre.com.br/authorization');
+  pendingOAuth.set(state, {
+    codeVerifier,
+    expiresAt: now + OAUTH_TTL_MS
+  });
+
+  const authorizationUrl = new URL(
+    'https://auth.mercadolivre.com.br/authorization'
+  );
+
   authorizationUrl.searchParams.set('response_type', 'code');
   authorizationUrl.searchParams.set('client_id', process.env.ML_CLIENT_ID);
   authorizationUrl.searchParams.set('redirect_uri', process.env.ML_REDIRECT_URI);
   authorizationUrl.searchParams.set('state', state);
   authorizationUrl.searchParams.set('code_challenge', codeChallenge);
   authorizationUrl.searchParams.set('code_challenge_method', 'S256');
+
   res.redirect(authorizationUrl.toString());
 });
 
-// CALLBACK OAUTH
 app.get('/auth/callback', async (req, res) => {
   try {
-    if (req.query.error) throw new Error(String(req.query.error_description || req.query.error));
+    if (req.query.error) {
+      throw new Error(String(req.query.error_description || req.query.error));
+    }
 
     const receivedState = String(req.query.state || '');
-    if (!receivedState) throw new Error('Parâmetro state não recebido.');
+
+    if (!receivedState) {
+      throw new Error('Parâmetro state não recebido.');
+    }
 
     const pending = pendingOAuth.get(receivedState);
     pendingOAuth.delete(receivedState);
+
     if (!pending || pending.expiresAt <= Date.now()) {
       throw new Error('Sessão expirada. Inicie a conexão novamente.');
     }
-    if (!req.query.code) throw new Error('Código de autorização não recebido.');
+
+    if (!req.query.code) {
+      throw new Error('Código de autorização não recebido.');
+    }
 
     const tokenParams = new URLSearchParams({
       grant_type: 'authorization_code',
@@ -133,26 +183,44 @@ app.get('/auth/callback', async (req, res) => {
       code_verifier: pending.codeVerifier
     });
 
-    const tokenResponse = await fetch('https://api.mercadolibre.com/oauth/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: tokenParams.toString()
-    });
+    const tokenResponse = await fetch(
+      'https://api.mercadolibre.com/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: tokenParams.toString()
+      }
+    );
+
     const tokenData = await tokenResponse.json();
+
     if (!tokenResponse.ok) {
-      throw new Error(tokenData.message || tokenData.error_description || tokenData.error || 'Falha na autorização.');
+      throw new Error(
+        tokenData.message ||
+        tokenData.error_description ||
+        tokenData.error ||
+        'Falha na autorização.'
+      );
     }
 
     saveTokens(tokenData);
+
     console.log('Mercado Livre conectado com sucesso.');
     res.redirect('/?ml=connected');
+
   } catch (error) {
     console.error('Falha OAuth:', error.message);
-    res.redirect('/?ml=error&reason=' + encodeURIComponent(error.message));
+
+    res.redirect(
+      '/?ml=error&reason=' + encodeURIComponent(error.message)
+    );
   }
 });
 
-// STATUS DA CONEXÃO
+// ==========================================
+// STATUS E CONEXÃO
+// ==========================================
+
 app.get('/api/ml/status', (_req, res) => {
   res.json({
     connected: !!mlTokens,
@@ -162,13 +230,11 @@ app.get('/api/ml/status', (_req, res) => {
   });
 });
 
-// DESCONEXÃO
 app.post('/api/ml/disconnect', (_req, res) => {
   mlTokens = null;
   res.json({ ok: true });
 });
 
-// DADOS DO VENDEDOR
 app.get('/api/ml/me', async (_req, res) => {
   try {
     const user = await mlGet('https://api.mercadolibre.com/users/me');
@@ -178,20 +244,34 @@ app.get('/api/ml/me', async (_req, res) => {
   }
 });
 
-// HISTÓRICO DE PEDIDOS DO ANO, COM PAGINAÇÃO
+// ==========================================
+// BUSCA DE PEDIDOS
+// ==========================================
+
 async function fetchYearOrders(sellerId, year) {
   const start = `${year}-01-01T00:00:00.000-03:00`;
+
   const todaySP = saoPauloDateKey();
-  const endDate = String(year) === todaySP.slice(0, 4) ? todaySP : `${year}-12-31`;
+
+  const endDate =
+    String(year) === todaySP.slice(0, 4)
+      ? todaySP
+      : `${year}-12-31`;
+
   const end = `${endDate}T23:59:59.999-03:00`;
+
   const limit = 50;
   let offset = 0;
   let total = null;
+
   const all = [];
   const seen = new Set();
 
   while (total === null || offset < total) {
-    const url = new URL('https://api.mercadolibre.com/orders/search');
+    const url = new URL(
+      'https://api.mercadolibre.com/orders/search'
+    );
+
     url.searchParams.set('seller', sellerId);
     url.searchParams.set('sort', 'date_desc');
     url.searchParams.set('limit', String(limit));
@@ -200,11 +280,18 @@ async function fetchYearOrders(sellerId, year) {
     url.searchParams.set('order.date_created.to', end);
 
     const page = await mlGet(url.toString());
-    const results = Array.isArray(page.results) ? page.results : [];
-    total = Number(page.paging?.total ?? (offset + results.length));
+
+    const results = Array.isArray(page.results)
+      ? page.results
+      : [];
+
+    total = Number(
+      page.paging?.total ?? (offset + results.length)
+    );
 
     for (const order of results) {
       const key = String(order.id);
+
       if (!seen.has(key)) {
         seen.add(key);
         all.push(order);
@@ -212,12 +299,27 @@ async function fetchYearOrders(sellerId, year) {
     }
 
     if (!results.length) break;
+
     offset += results.length;
-    if (offset > 100000) throw new Error('A consulta excedeu o limite de segurança de paginação.');
+
+    if (offset > 100000) {
+      throw new Error(
+        'A consulta excedeu o limite de segurança de paginação.'
+      );
+    }
   }
 
-  return { orders: all, total: total ?? all.length, start, end };
+  return {
+    orders: all,
+    total: total ?? all.length,
+    start,
+    end
+  };
 }
+
+// ==========================================
+// FORMATAÇÃO DOS PEDIDOS
+// ==========================================
 
 function compactOrder(order) {
   return {
@@ -225,10 +327,15 @@ function compactOrder(order) {
     date_created: order.date_created,
     date_closed: order.date_closed,
     status: order.status,
-    buyer: { id: order.buyer?.id || null },
+
+    buyer: {
+      id: order.buyer?.id || null
+    },
+
     total_amount: order.total_amount,
     paid_amount: order.paid_amount,
     currency_id: order.currency_id,
+
     order_items: (order.order_items || []).map(item => ({
       item: {
         id: item.item?.id || null,
@@ -238,6 +345,7 @@ function compactOrder(order) {
       unit_price: item.unit_price,
       listing_type_id: item.listing_type_id
     })),
+
     payments: (order.payments || []).map(payment => ({
       id: payment.id,
       status: payment.status,
@@ -248,65 +356,98 @@ function compactOrder(order) {
   };
 }
 
-// PRODUTOS VENDIDOS E ANÚNCIOS ATIVOS
+// ==========================================
+// PRODUTOS E ANÚNCIOS
+// ==========================================
+
 async function fetchSoldProducts(orders, sellerId) {
   const soldIds = orders.flatMap(order =>
-    (order.order_items || []).map(i => i.item?.id).filter(Boolean)
+    (order.order_items || [])
+      .map(i => i.item?.id)
+      .filter(Boolean)
   );
 
   const activeIds = [];
+
   let offset = 0;
   let total = null;
 
   while (total === null || offset < total) {
-    const url = new URL(`https://api.mercadolibre.com/users/${encodeURIComponent(sellerId)}/items/search`);
+    const url = new URL(
+      `https://api.mercadolibre.com/users/${encodeURIComponent(sellerId)}/items/search`
+    );
+
     url.searchParams.set('status', 'active');
     url.searchParams.set('limit', '100');
     url.searchParams.set('offset', String(offset));
 
     const page = await mlGet(url.toString());
-    const results = Array.isArray(page.results) ? page.results : [];
-    total = Number(page.paging?.total ?? (offset + results.length));
+
+    const results = Array.isArray(page.results)
+      ? page.results
+      : [];
+
+    total = Number(
+      page.paging?.total ?? (offset + results.length)
+    );
+
     activeIds.push(...results);
 
     if (!results.length) break;
+
     offset += results.length;
+
     if (offset >= 1000 || offset > total) break;
   }
 
-  const ids = [...new Set([...soldIds, ...activeIds].map(String))];
+  const ids = [
+    ...new Set([...soldIds, ...activeIds].map(String))
+  ];
+
   const products = [];
   const concurrency = 5;
 
   for (let i = 0; i < ids.length; i += concurrency) {
     const batch = ids.slice(i, i + concurrency);
 
-    const results = await Promise.all(batch.map(async id => {
-      try {
-        const item = await mlGet(`https://api.mercadolibre.com/items/${encodeURIComponent(id)}`);
-        return {
-          id: item.id,
-          title: item.title || id,
-          price: item.price ?? null,
-          original_price: item.original_price ?? null,
-          currency_id: item.currency_id || 'BRL',
-          status: item.status || 'unknown',
-          thumbnail: item.thumbnail || item.pictures?.[0]?.secure_url || null,
-          permalink: item.permalink || null,
-          available_quantity: item.available_quantity ?? null
-        };
-      } catch (error) {
-        console.warn(`Não foi possível consultar o anúncio ${id}: ${error.message}`);
-        return {
-          id,
-          title: id,
-          price: null,
-          status: 'indisponível',
-          thumbnail: null,
-          permalink: null
-        };
-      }
-    }));
+    const results = await Promise.all(
+      batch.map(async id => {
+        try {
+          const item = await mlGet(
+            `https://api.mercadolibre.com/items/${encodeURIComponent(id)}`
+          );
+
+          return {
+            id: item.id,
+            title: item.title || id,
+            price: item.price ?? null,
+            original_price: item.original_price ?? null,
+            currency_id: item.currency_id || 'BRL',
+            status: item.status || 'unknown',
+            thumbnail:
+              item.thumbnail ||
+              item.pictures?.[0]?.secure_url ||
+              null,
+            permalink: item.permalink || null,
+            available_quantity: item.available_quantity ?? null
+          };
+
+        } catch (error) {
+          console.warn(
+            `Não foi possível consultar o anúncio ${id}: ${error.message}`
+          );
+
+          return {
+            id,
+            title: id,
+            price: null,
+            status: 'indisponível',
+            thumbnail: null,
+            permalink: null
+          };
+        }
+      })
+    );
 
     products.push(...results);
   }
@@ -314,26 +455,43 @@ async function fetchSoldProducts(orders, sellerId) {
   return products;
 }
 
-// VISUALIZAÇÕES MENSAIS
+// ==========================================
+// VISITAS DO MERCADO LIVRE
+// ==========================================
+
 async function fetchYearVisits(userId, year) {
   const now = new Date();
+
   const todaySP = saoPauloDateParts(now);
+
   const currentYear = Number(todaySP.year);
   const currentMonth = Number(todaySP.month);
+
   const metrics = {};
 
   for (let month = 1; month <= 12; month++) {
-    if (year > currentYear || (year === currentYear && month > currentMonth)) continue;
+    if (
+      year > currentYear ||
+      (year === currentYear && month > currentMonth)
+    ) {
+      continue;
+    }
 
-    const from = `${year}-${String(month).padStart(2, '0')}-01`;
+    const from =
+      `${year}-${String(month).padStart(2, '0')}-01`;
+
     const lastDay = new Date(year, month, 0).getDate();
 
-    const to = year === currentYear && month === currentMonth
-      ? `${todaySP.year}-${todaySP.month}-${todaySP.day}`
-      : `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+    const to =
+      year === currentYear && month === currentMonth
+        ? `${todaySP.year}-${todaySP.month}-${todaySP.day}`
+        : `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
 
     try {
-      const url = new URL(`https://api.mercadolibre.com/users/${encodeURIComponent(userId)}/items_visits`);
+      const url = new URL(
+        `https://api.mercadolibre.com/users/${encodeURIComponent(userId)}/items_visits`
+      );
+
       url.searchParams.set('date_from', from);
       url.searchParams.set('date_to', to);
 
@@ -344,8 +502,11 @@ async function fetchYearVisits(userId, year) {
         date_from: from,
         date_to: to
       };
+
     } catch (error) {
-      console.warn(`Não foi possível consultar visitas de ${from} a ${to}: ${error.message}`);
+      console.warn(
+        `Não foi possível consultar visitas de ${from} a ${to}: ${error.message}`
+      );
 
       metrics[`${year}-${String(month).padStart(2, '0')}`] = {
         visits: null,
@@ -359,73 +520,167 @@ async function fetchYearVisits(userId, year) {
   return metrics;
 }
 
-// SINCRONIZAÇÃO COMPLETA
+// ==========================================
+// SINCRONIZAÇÃO
+// ==========================================
+
 app.post('/api/ml/sync', async (req, res) => {
   try {
     if (!mlTokens) {
-      return res.status(401).json({ error: 'Conta não conectada.' });
+      return res.status(401).json({
+        error: 'Conta não conectada.'
+      });
     }
 
-    const currentYearSP = Number(saoPauloDateParts().year);
-    const requestedYear = Number(req.body?.year || currentYearSP);
+    const currentYearSP = Number(
+      saoPauloDateParts().year
+    );
 
-    if (!Number.isInteger(requestedYear) || requestedYear < 2020 || requestedYear > currentYearSP) {
-      return res.status(400).json({ error: 'Ano inválido para sincronização.' });
+    const requestedYear = Number(
+      req.body?.year || currentYearSP
+    );
+
+    if (
+      !Number.isInteger(requestedYear) ||
+      requestedYear < 2020 ||
+      requestedYear > currentYearSP
+    ) {
+      return res.status(400).json({
+        error: 'Ano inválido para sincronização.'
+      });
     }
 
-    const user = await mlGet('https://api.mercadolibre.com/users/me');
-    const history = await fetchYearOrders(user.id, requestedYear);
+    const user = await mlGet(
+      'https://api.mercadolibre.com/users/me'
+    );
 
-    const ordersData = history.orders.map(compactOrder);
+    const allHistory = req.body?.allHistory === true;
+
+    const registrationYear = Number(
+      String(user.registration_date || '').slice(0, 4)
+    );
+
+    const firstYear =
+      allHistory &&
+      Number.isInteger(registrationYear) &&
+      registrationYear >= 2000
+        ? Math.min(registrationYear, requestedYear)
+        : requestedYear;
+
+    const years = allHistory
+      ? Array.from(
+          { length: requestedYear - firstYear + 1 },
+          (_, index) => firstYear + index
+        )
+      : [requestedYear];
+
+    const histories = [];
+
+    for (const year of years) {
+      histories.push(
+        await fetchYearOrders(user.id, year)
+      );
+    }
+
+    const allOrders = [
+      ...new Map(
+        histories
+          .flatMap(item => item.orders)
+          .map(order => [String(order.id), order])
+      ).values()
+    ];
+
+    const ordersData = allOrders.map(compactOrder);
 
     const [products, monthlyMetrics] = await Promise.all([
-      fetchSoldProducts(history.orders, user.id),
+      fetchSoldProducts(allOrders, user.id),
       fetchYearVisits(user.id, requestedYear)
     ]);
 
-    const paidOrders = ordersData.filter(o =>
-      !['cancelled', 'refunded', 'invalid'].includes(String(o.status || '').toLowerCase()) &&
-      (o.status === 'paid' || (o.payments || []).some(p => p.status === 'approved'))
+    const totalOrders = histories.reduce(
+      (sum, item) => sum + Number(item.total || 0),
+      0
+    );
+
+    const dateFrom = histories[0]?.start || null;
+    const dateTo = histories[histories.length - 1]?.end || null;
+
+    const paidOrders = ordersData.filter(order =>
+      !['cancelled', 'refunded', 'invalid'].includes(
+        String(order.status || '').toLowerCase()
+      ) &&
+      (
+        order.status === 'paid' ||
+        (order.payments || []).some(
+          payment => payment.status === 'approved'
+        )
+      )
     );
 
     res.json({
       ok: true,
       year: requestedYear,
-      user: { id: user.id, nickname: user.nickname },
-      total: history.total,
+
+      user: {
+        id: user.id,
+        nickname: user.nickname
+      },
+
+      total: totalOrders,
       loaded: ordersData.length,
+      years,
+
       ordersData,
       products,
+
       dashboard: {
         year: requestedYear,
         monthlyMetrics,
         paidOrders: paidOrders.length,
-        dateFrom: history.start,
-        dateTo: history.end
+        dateFrom,
+        dateTo
       },
-      note: `Histórico de ${requestedYear} consultado com paginação.`
+
+      note: allHistory
+        ? `Histórico consultado desde ${firstYear} até ${requestedYear}.`
+        : `Histórico de ${requestedYear} consultado com paginação.`
     });
+
   } catch (error) {
     console.error('Erro na sincronização:', error);
-    res.status(500).json({ error: error.message || 'Falha na sincronização.' });
+
+    res.status(500).json({
+      error: error.message || 'Falha na sincronização.'
+    });
   }
 });
 
-// POSIÇÃO ORGÂNICA DOS ANÚNCIOS
+// ==========================================
+// POSICIONAMENTO DOS ANÚNCIOS
+// ==========================================
+
 app.post('/api/ml/positions', async (req, res) => {
   try {
     if (!mlTokens) {
-      return res.status(401).json({ error: 'Conecte sua conta do Mercado Livre primeiro.' });
+      return res.status(401).json({
+        error: 'Conecte sua conta do Mercado Livre primeiro.'
+      });
     }
 
-    const checks = Array.isArray(req.body?.checks) ? req.body.checks : [];
+    const checks = Array.isArray(req.body?.checks)
+      ? req.body.checks
+      : [];
 
     if (!checks.length) {
-      return res.status(400).json({ error: 'Informe ao menos um anúncio e uma palavra-chave.' });
+      return res.status(400).json({
+        error: 'Informe ao menos um anúncio e uma palavra-chave.'
+      });
     }
 
     if (checks.length > 20) {
-      return res.status(400).json({ error: 'Consulte no máximo 20 anúncios por vez.' });
+      return res.status(400).json({
+        error: 'Consulte no máximo 20 anúncios por vez.'
+      });
     }
 
     const results = [];
@@ -447,21 +702,33 @@ app.post('/api/ml/positions', async (req, res) => {
       let found = null;
       let scanned = 0;
       let total = null;
+
       const pageSize = 50;
       const maxPages = 5;
 
       for (let pageIndex = 0; pageIndex < maxPages; pageIndex++) {
-        const url = new URL('https://api.mercadolibre.com/sites/MLB/search');
+        const url = new URL(
+          'https://api.mercadolibre.com/sites/MLB/search'
+        );
+
         url.searchParams.set('q', keyword);
         url.searchParams.set('limit', String(pageSize));
         url.searchParams.set('offset', String(pageIndex * pageSize));
 
         const data = await mlGet(url.toString());
-        const items = Array.isArray(data.results) ? data.results : [];
 
-        total = Number(data.paging?.total ?? total ?? items.length);
+        const items = Array.isArray(data.results)
+          ? data.results
+          : [];
 
-        const index = items.findIndex(item => String(item.id) === itemId);
+        total = Number(
+          data.paging?.total ?? total ?? items.length
+        );
+
+        const index = items.findIndex(
+          item => String(item.id) === itemId
+        );
+
         scanned += items.length;
 
         if (index >= 0) {
@@ -479,18 +746,25 @@ app.post('/api/ml/positions', async (req, res) => {
           break;
         }
 
-        if (!items.length || (total !== null && (pageIndex + 1) * pageSize >= total)) break;
+        if (
+          !items.length ||
+          (total !== null && (pageIndex + 1) * pageSize >= total)
+        ) {
+          break;
+        }
       }
 
       results.push({
         itemId,
         keyword,
+
         ...(found || {
           found: false,
           position: null,
           page: null,
           positionOnPage: null
         }),
+
         scanned,
         total,
         checkedAt: new Date().toISOString(),
@@ -507,11 +781,20 @@ app.post('/api/ml/positions', async (req, res) => {
 
   } catch (error) {
     console.error('Erro ao consultar posições:', error);
-    res.status(500).json({ error: error.message || 'Falha ao consultar posições.' });
+
+    res.status(error.statusCode || 500).json({
+      error:
+        error.statusCode === 403
+          ? 'A API de busca do Mercado Livre recusou esta aplicação (403). Não é possível informar uma posição confiável por este endpoint.'
+          : (error.message || 'Falha ao consultar posições.')
+    });
   }
 });
 
-// TESTE DO SERVIDOR
+// ==========================================
+// HEALTH CHECK
+// ==========================================
+
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
@@ -519,6 +802,10 @@ app.get('/health', (_req, res) => {
     storage: 'memory'
   });
 });
+
+// ==========================================
+// INICIALIZAÇÃO
+// ==========================================
 
 const port = Number(process.env.PORT || 3000);
 
