@@ -458,9 +458,9 @@ function renderHomeDashboard() {
   const todayOrders = mlOrders.filter(order => order.date_created && localDateKey(order.date_created) === todayKey && isMlPaid(order));
   const monthOrders = mlOrders.filter(order => order.date_created && getMonthKey(order.date_created) === monthKey && isMlPaid(order));
   const todayGross = todayOrders.reduce((total,order)=>total+mlOrderTotals(order).gross,0);
+  const manualMonthSales = sales.filter(sale=>sale.status==='paid' && getMonthKey(sale.date)===monthKey);
   const monthGross = monthOrders.reduce((total,order)=>total+mlOrderTotals(order).gross,0) + manualMonthSales.reduce((total,sale)=>total+num(sale.gross),0);
   const visits = mlDashboard?.monthlyMetrics?.[monthKey]?.visits;
-  const manualMonthSales = sales.filter(sale=>sale.status==='paid' && getMonthKey(sale.date)===monthKey);
   const conversion = Number(visits)>0 ? monthOrders.length/Number(visits)*100 : null;
   document.getElementById('homeLiveGross').textContent = money(todayGross);
   document.getElementById('homeLiveMeta').textContent = `${todayOrders.length} pedido(s) pago(s) hoje · ${mlOrders.length} pedidos carregados no histórico`;
